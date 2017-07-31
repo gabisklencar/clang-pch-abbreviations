@@ -88,7 +88,10 @@
 #include <limits>
 #include <new>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
+#include <iostream>
+#include <cstdio>
 
 using namespace clang;
 using namespace clang::serialization;
@@ -4137,6 +4140,33 @@ void ASTRecordWriter::AddAttributes(ArrayRef<const Attr *> Attrs) {
   }
 }
 
+void ASTRecordWriter::AddAttributeCommonFields(ArrayRef<const Attr *> Attrs) {
+  auto &Record = *this;
+  Record.push_back(Attrs.size());
+  for (const auto *A : Attrs) {
+    Record.push_back(A->getKind()); // FIXME: stable encoding, target attrs
+    Record.AddSourceRange(A->getRange());
+  }
+}
+
+void ASTRecordWriter::AddAttributePadding(unsigned AttrSize, unsigned MaxAttrs) {
+  auto &Record = *this;
+  for (unsigned I = AttrSize; I < MaxAttrs; ++I) {
+    Record.push_back(0);
+    Record.push_back(0);
+    Record.push_back(0);
+  }
+}
+
+void ASTRecordWriter::AddAttributeSpecificFields(ArrayRef<const Attr *> Attrs) {
+  auto &Record = *this;
+  for (const auto *A : Attrs) {
+
+#include "clang/Serialization/AttrPCHWrite.inc"
+
+  }
+}
+
 void ASTWriter::AddToken(const Token &Tok, RecordDataImpl &Record) {
   AddSourceLocation(Tok.getLocation(), Record);
   Record.push_back(Tok.getLength());
@@ -4280,6 +4310,28 @@ static void AddLazyVectorDecls(ASTWriter &Writer, Vector &Vec,
        I != E; ++I) {
     Writer.AddDeclRef(*I, Record);
   }
+}
+
+static ASTWriter::FuncParamSpec CreateFuncParam(unsigned FunctionCount,
+                                     unsigned ParamCount) {
+  return { (ParamCount == 0 || ParamCount == FunctionCount),
+           (ParamCount == FunctionCount) };
+}
+
+static ASTWriter::FuncParamSpec CreateVBRFuncParam(unsigned FunctionCount,
+                                                   unsigned ParamCount) {
+  return { (ParamCount == 0), 0 };
+}
+
+static ASTWriter::FuncParamSpec CreateFuncParamArray(unsigned FunctionCount,
+                                          unsigned ParamCounts[],
+                                          unsigned ArrayLength) {
+  for (unsigned I = 0; I < ArrayLength; ++I) {
+    if (ParamCounts[I] == FunctionCount) {
+      return { true, I };
+    }
+  }
+  return { false, 0 };
 }
 
 uint64_t ASTWriter::WriteASTCore(Sema &SemaRef, StringRef isysroot,
@@ -4611,11 +4663,126 @@ uint64_t ASTWriter::WriteASTCore(Sema &SemaRef, StringRef isysroot,
 
   RecordData DeclUpdatesOffsetsRecord;
 
+  // Compute some stats
+  unsigned FunctionCount = 0;
+  unsigned Ctx = 0;
+  unsigned Invalid = 0;
+  unsigned Implicit = 0;
+  unsigned Used = 0;
+  unsigned Referenced = 0;
+  unsigned ObjC = 0;
+  unsigned Access[4];
+  for (int I = 0; I < 4; I++) { Access[I] = 0; }
+  unsigned ModulePrivate = 0;
+  unsigned NameKind[10];
+  for (int I = 0; I < 10; I++) { NameKind[I] = 0; }
+  unsigned AnonDeclNumber = 0;
+  unsigned HasExtInfo = 0;
+  unsigned Inlined = 0;
+  unsigned InlineSpec = 0;
+  unsigned VirtualAsWritten = 0;
+  unsigned Pure = 0;
+  unsigned InheritedProto = 0;
+  unsigned WrittenProto = 0;
+  unsigned Deleted = 0;
+  unsigned Trivial = 0;
+  unsigned Defaulted = 0;
+  unsigned ExplDefaulted = 0;
+  unsigned ImplRetZero = 0;
+  unsigned Constexp = 0;
+  unsigned SkippedBody = 0;
+  unsigned LateParsed = 0;
+  unsigned HasBody = 0;
+  unsigned HasAttrs = 0;
+  unsigned TemplKind[5];
+  for (int I = 0; I < 5; I++) { TemplKind[I] = 0; }
+  unsigned Redecl = 0;
+
+  // Find the maximum number of parameters in the functions.
+  std::queue<DeclOrType> temp;
+  while (!DeclTypesToEmit.empty()) {
+    DeclOrType DOT = DeclTypesToEmit.front();
+    DeclTypesToEmit.pop();
+    temp.push(DOT);
+
+    if (DOT.isDecl()) {
+      if (FunctionDecl *FD = dyn_cast<FunctionDecl>(DOT.getDecl())) {
+        FunctionCount++;
+        if (FD->getDeclContext() != FD->getLexicalDeclContext()) { Ctx++; }
+        if (FD->isInvalidDecl()) { Invalid++; }
+        if (FD->isImplicit()) { Implicit++; }
+        if (FD->isUsed()) { Used++; }
+        if (FD->isReferenced()) { Referenced++; }
+        if (FD->isTopLevelDeclInObjCContainer()) { ObjC++; }
+        Access[FD->getAccess()]++;
+        if (FD->isModulePrivate()) { ModulePrivate++; }
+        NameKind[FD->getDeclName().getNameKind()]++;
+        if (needsAnonymousDeclarationNumber(FD)) { AnonDeclNumber++; }
+        if (FD->getQualifier()) { HasExtInfo++; }
+        if (FD->isInlined()) { Inlined++; } 
+        if (FD->isInlineSpecified()) { InlineSpec++; }
+        if (FD->isVirtualAsWritten()) { VirtualAsWritten++; } 
+        if (FD->isPure()) { Pure++; } 
+        if (FD->hasInheritedPrototype()) { InheritedProto++; }
+        if (FD->hasWrittenPrototype()) { WrittenProto++; }
+        if (FD->isDeleted()) { Deleted++; }
+        if (FD->isTrivial()) { Trivial++; } 
+        if (FD->isDefaulted()) { Defaulted++; }
+        if (FD->isExplicitlyDefaulted()) { ExplDefaulted++; }
+        if (FD->hasImplicitReturnZero()) { ImplRetZero++; }
+        if (FD->isConstexpr()) { Constexp++; }
+        if (FD->hasSkippedBody()) { SkippedBody++; }
+        if (FD->isLateTemplateParsed()) { LateParsed++; }
+        if (FD->doesThisDeclarationHaveABody()) { HasBody++; }
+        if (FD->hasAttrs()) { HasAttrs++; }
+        TemplKind[FD->getTemplatedKind()]++;
+        if (FD->getFirstDecl() != FD->getMostRecentDecl()) { Redecl++; }
+      }
+    }
+  }
+
+  while (!temp.empty()) {
+    DeclOrType DOT = temp.front();
+    temp.pop();
+    DeclTypesToEmit.push(DOT);
+  }
+
+  FunctionAbbrevParams FuncParams;
+  FuncParams.Ctx = CreateVBRFuncParam(FunctionCount, Ctx);
+  FuncParams.Invalid = CreateFuncParam(FunctionCount, Invalid);
+  FuncParams.Implicit = CreateFuncParam(FunctionCount, Implicit);
+  FuncParams.Used = CreateFuncParam(FunctionCount, Used);
+  FuncParams.Referenced = CreateFuncParam(FunctionCount, Referenced);
+  FuncParams.ObjC = CreateFuncParam(FunctionCount, ObjC);
+  FuncParams.Access = CreateFuncParamArray(FunctionCount, Access, 4);
+  FuncParams.ModulePrivate = CreateFuncParam(FunctionCount, ModulePrivate);
+  FuncParams.NameKind = CreateFuncParamArray(FunctionCount, NameKind, 10);
+  FuncParams.AnonDeclNumber = CreateVBRFuncParam(FunctionCount, AnonDeclNumber);
+  FuncParams.HasExtInfo = CreateFuncParam(FunctionCount, HasExtInfo);
+  FuncParams.Inlined = CreateFuncParam(FunctionCount, Inlined);
+  FuncParams.InlineSpec = CreateFuncParam(FunctionCount, InlineSpec);
+  FuncParams.VirtualAsWritten = CreateFuncParam(FunctionCount, VirtualAsWritten);
+  FuncParams.Pure = CreateFuncParam(FunctionCount, Pure);
+  FuncParams.InheritedProto = CreateFuncParam(FunctionCount, InheritedProto);
+  FuncParams.WrittenProto = CreateFuncParam(FunctionCount, WrittenProto);
+  FuncParams.Deleted = CreateFuncParam(FunctionCount, Deleted);
+  FuncParams.Trivial = CreateFuncParam(FunctionCount, Trivial);
+  FuncParams.Defaulted = CreateFuncParam(FunctionCount, Defaulted);
+  FuncParams.ExplDefaulted = CreateFuncParam(FunctionCount, ExplDefaulted);
+  FuncParams.ImplRetZero = CreateFuncParam(FunctionCount, ImplRetZero);
+  FuncParams.Constexp = CreateFuncParam(FunctionCount, Constexp);
+  FuncParams.SkippedBody = CreateFuncParam(FunctionCount, SkippedBody);
+  FuncParams.LateParsed = CreateFuncParam(FunctionCount, LateParsed);
+  FuncParams.HasBody = CreateFuncParam(FunctionCount, HasBody);
+  FuncParams.HasAttrs = CreateFuncParam(FunctionCount, HasAttrs);
+  FuncParams.TemplKind = CreateFuncParamArray(FunctionCount, TemplKind, 5);
+  FuncParams.Redecl = CreateVBRFuncParam(FunctionCount, Redecl);
+
   // Keep writing types, declarations, and declaration update records
   // until we've emitted all of them.
   Stream.EnterSubblock(DECLTYPES_BLOCK_ID, /*bits for abbreviations*/5);
   WriteTypeAbbrevs();
-  WriteDeclAbbrevs();
+  WriteDeclAbbrevs(FuncParams);
   do {
     WriteDeclUpdatesBlocks(DeclUpdatesOffsetsRecord);
     while (!DeclTypesToEmit.empty()) {
@@ -4623,8 +4790,9 @@ uint64_t ASTWriter::WriteASTCore(Sema &SemaRef, StringRef isysroot,
       DeclTypesToEmit.pop();
       if (DOT.isType())
         WriteType(DOT.getType());
-      else
-        WriteDecl(Context, DOT.getDecl());
+      else {
+        WriteDecl(Context, DOT.getDecl(), FuncParams);
+      }
     }
   } while (!DeclUpdates.empty());
   Stream.ExitBlock();

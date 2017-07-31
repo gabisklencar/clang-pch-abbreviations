@@ -37,12 +37,14 @@ namespace clang {
 
     serialization::DeclCode Code;
     unsigned AbbrevToUse;
+    ASTWriter::FunctionAbbrevParams FuncParams;
 
   public:
     ASTDeclWriter(ASTWriter &Writer, ASTContext &Context,
-                  ASTWriter::RecordDataImpl &Record)
+                  ASTWriter::RecordDataImpl &Record,
+                  ASTWriter::FunctionAbbrevParams Params)
         : Writer(Writer), Context(Context), Record(Writer, Record),
-          Code((serialization::DeclCode)0), AbbrevToUse(0) {}
+          Code((serialization::DeclCode)0), AbbrevToUse(0), FuncParams(Params) {}
 
     uint64_t Emit(Decl *D) {
       if (!Code)
@@ -50,6 +52,7 @@ namespace clang {
             D->getDeclKindName() + "'");
       return Record.Emit(Code, AbbrevToUse);
     }
+
 
     void Visit(Decl *D);
 
@@ -270,7 +273,7 @@ void ASTDeclWriter::Visit(Decl *D) {
   // have been written. We want it last because we will not read it back when
   // retrieving it from the AST, we'll just lazily set the offset. 
   if (FunctionDecl *FD = dyn_cast<FunctionDecl>(D)) {
-    Record.push_back(FD->doesThisDeclarationHaveABody());
+    // The result of doesThisDeclarationHaveABody is serialised earlier.
     if (FD->doesThisDeclarationHaveABody())
       Record.AddFunctionDefinition(FD);
   }
@@ -289,9 +292,12 @@ void ASTDeclWriter::VisitDecl(Decl *D) {
   else
     Record.push_back(0);
   Record.push_back(D->isInvalidDecl());
-  Record.push_back(D->hasAttrs());
-  if (D->hasAttrs())
-    Record.AddAttributes(D->getAttrs());
+  if (!dyn_cast<FunctionDecl>(D)) {
+    Record.push_back(D->hasAttrs());
+    if (D->hasAttrs()) {
+      Record.AddAttributes(D->getAttrs());
+    }
+  }
   Record.push_back(D->isImplicit());
   Record.push_back(D->isUsed(false));
   Record.push_back(D->isReferenced());
@@ -502,15 +508,58 @@ void ASTDeclWriter::VisitEnumConstantDecl(EnumConstantDecl *D) {
 void ASTDeclWriter::VisitDeclaratorDecl(DeclaratorDecl *D) {
   VisitValueDecl(D);
   Record.AddSourceLocation(D->getInnerLocStart());
-  Record.push_back(D->hasExtInfo());
-  if (D->hasExtInfo())
-    Record.AddQualifierInfo(*D->getExtInfo());
+  if (!dyn_cast<FunctionDecl>(D)) {
+    Record.push_back(D->hasExtInfo());
+    if (D->hasExtInfo())
+      Record.AddQualifierInfo(*D->getExtInfo());
+  }
+}
+
+static bool MatchesFuncParam(ASTWriter::FuncParamSpec &Param, unsigned Value) {
+  return !Param.Literal || Param.Value == Value;
 }
 
 void ASTDeclWriter::VisitFunctionDecl(FunctionDecl *D) {
-  VisitRedeclarable(D);
+  // Set the abbreviation early so called Visit function can decide whether to
+  // pad variable-length arguments.
+  if (D->getDeclContext() == D->getLexicalDeclContext() &&
+      MatchesFuncParam(FuncParams.Invalid, D->isInvalidDecl()) &&
+      MatchesFuncParam(FuncParams.Implicit, D->isImplicit()) &&
+      MatchesFuncParam(FuncParams.Used, D->isUsed()) &&
+      MatchesFuncParam(FuncParams.Referenced, D->isReferenced()) &&
+      MatchesFuncParam(FuncParams.ObjC, D->isTopLevelDeclInObjCContainer()) &&
+      MatchesFuncParam(FuncParams.Access, D->getAccess()) &&
+      MatchesFuncParam(FuncParams.ModulePrivate, D->isModulePrivate()) &&
+      MatchesFuncParam(FuncParams.NameKind, D->getDeclName().getNameKind()) &&
+      MatchesFuncParam(FuncParams.AnonDeclNumber,
+                       needsAnonymousDeclarationNumber(D)) &&
+      MatchesFuncParam(FuncParams.HasExtInfo, D->hasExtInfo()) &&
+      MatchesFuncParam(FuncParams.Inlined, D->isInlined()) &&
+      MatchesFuncParam(FuncParams.InlineSpec, D->isInlineSpecified()) &&
+      MatchesFuncParam(FuncParams.VirtualAsWritten, D->isVirtualAsWritten()) &&
+      MatchesFuncParam(FuncParams.Pure, D->isPure()) &&
+      MatchesFuncParam(FuncParams.InheritedProto, D->hasInheritedPrototype()) &&
+      MatchesFuncParam(FuncParams.WrittenProto, D->hasWrittenPrototype()) &&
+      MatchesFuncParam(FuncParams.Deleted, D->isDeleted()) &&
+      MatchesFuncParam(FuncParams.Trivial, D->isTrivial()) &&
+      MatchesFuncParam(FuncParams.Defaulted, D->isDefaulted()) &&
+      MatchesFuncParam(FuncParams.ExplDefaulted, D->isExplicitlyDefaulted()) &&
+      MatchesFuncParam(FuncParams.ImplRetZero, D->hasImplicitReturnZero()) &&
+      MatchesFuncParam(FuncParams.Constexp, D->isConstexpr()) &&
+      MatchesFuncParam(FuncParams.SkippedBody, D->hasSkippedBody()) &&
+      MatchesFuncParam(FuncParams.LateParsed, D->isLateTemplateParsed()) &&
+      MatchesFuncParam(FuncParams.HasBody, D->doesThisDeclarationHaveABody()) &&
+      MatchesFuncParam(FuncParams.HasAttrs, D->hasAttrs()) &&
+      MatchesFuncParam(FuncParams.TemplKind, D->getTemplatedKind()) &&
+      MatchesFuncParam(FuncParams.Redecl,
+                       D->getFirstDecl() != D->getMostRecentDecl()) &&
+      D->getDeclName().getNameKind() != DeclarationName::CXXUsingDirective &&
+      !D->hasExtInfo() &&
+      !dyn_cast<CXXMethodDecl>(D)) {
+    AbbrevToUse = Writer.getDeclFunctionAbbrev();
+  }
+
   VisitDeclaratorDecl(D);
-  Record.AddDeclarationNameLoc(D->DNLoc, D->getDeclName());
   Record.push_back(D->getIdentifierNamespace());
   
   // FunctionDecl's body is handled last at ASTWriterDecl::Visit,
@@ -534,7 +583,20 @@ void ASTDeclWriter::VisitFunctionDecl(FunctionDecl *D) {
   Record.push_back(D->getLinkageInternal());
   Record.AddSourceLocation(D->getLocEnd());
 
+  Record.push_back(D->doesThisDeclarationHaveABody());
+  Record.push_back(D->hasAttrs());
+  Record.push_back(D->hasExtInfo());
   Record.push_back(D->getTemplatedKind());
+
+  // Visit Redeclarable at the end to abbreviate variable-length fields.
+  // Redeclarable has to be visited before template information to allow the
+  // reader to merge the redeclarations.
+  VisitRedeclarable(D);
+
+  if (D->hasExtInfo())
+    Record.AddQualifierInfo(*D->getExtInfo());
+
+  // Add template information
   switch (D->getTemplatedKind()) {
   case FunctionDecl::TK_NonTemplate:
     break;
@@ -603,6 +665,15 @@ void ASTDeclWriter::VisitFunctionDecl(FunctionDecl *D) {
   Record.push_back(D->param_size());
   for (auto P : D->parameters())
     Record.AddDeclRef(P);
+
+  if (D->hasAttrs()) {
+    Record.AddAttributes(D->getAttrs());
+  }
+
+  // Declaration name location is of variable length for declarations with
+  // non-identifier NameKind.
+  Record.AddDeclarationNameLoc(D->DNLoc, D->getDeclName());
+
   Code = serialization::DECL_FUNCTION;
 }
 
@@ -1699,7 +1770,26 @@ void ASTDeclWriter::VisitOMPCapturedExprDecl(OMPCapturedExprDecl *D) {
 // ASTWriter Implementation
 //===----------------------------------------------------------------------===//
 
-void ASTWriter::WriteDeclAbbrevs() {
+static void AbvFixedOrLiteral(std::shared_ptr<llvm::BitCodeAbbrev> Abv,
+                              unsigned FixedWidth,
+                              ASTWriter::FuncParamSpec &Param) {
+  if (Param.Literal) {
+    Abv->Add(llvm::BitCodeAbbrevOp(Param.Value));
+  } else {
+    Abv->Add(llvm::BitCodeAbbrevOp(llvm::BitCodeAbbrevOp::Fixed, FixedWidth));
+  }
+}
+
+static void AbvVBROrLiteral(std::shared_ptr<llvm::BitCodeAbbrev> Abv,
+                            ASTWriter::FuncParamSpec &Param) {
+  if (Param.Literal) {
+    Abv->Add(llvm::BitCodeAbbrevOp(Param.Value));
+  } else {
+    Abv->Add(llvm::BitCodeAbbrevOp(llvm::BitCodeAbbrevOp::VBR, 6));
+  }
+}
+
+void ASTWriter::WriteDeclAbbrevs(FunctionAbbrevParams FuncParams) {
   using namespace llvm;
 
   std::shared_ptr<BitCodeAbbrev> Abv;
@@ -1991,16 +2081,68 @@ void ASTWriter::WriteDeclAbbrevs() {
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6)); // TypeLoc
   DeclVarAbbrev = Stream.EmitAbbrev(std::move(Abv));
 
+  // Abbreviation for DECL_FUNCTION
+  // This abbreviation is for a function with at most one parameter, no
+  // redeclaration and no template kind
+  Abv = std::make_shared<BitCodeAbbrev>();
+  Abv->Add(BitCodeAbbrevOp(serialization::DECL_FUNCTION));
+  // Decl
+  Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));   // DeclContext
+  AbvVBROrLiteral(Abv, FuncParams.Ctx);                 // LexicalDeclContext
+  AbvFixedOrLiteral(Abv, 1, FuncParams.Invalid);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.Implicit);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.Used);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.Referenced);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.ObjC);
+  AbvFixedOrLiteral(Abv, 2, FuncParams.Access);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.ModulePrivate);
+  Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));   // SubmoduleID
+  // NamedDecl
+  AbvFixedOrLiteral(Abv, 4, FuncParams.NameKind);
+  Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));   // Identifier
+  AbvVBROrLiteral(Abv, FuncParams.AnonDeclNumber);
+  // ValueDecl
+  Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));   // Type
+  // DeclaratorDecl
+  Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));   // InnerLocStart
+  // FunctionDecl
+  Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 11)); // IDNS
+  Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 3)); // StorageClass
+  AbvFixedOrLiteral(Abv, 1, FuncParams.Inlined);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.InlineSpec);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.VirtualAsWritten);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.Pure);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.InheritedProto);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.WrittenProto);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.Deleted);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.Trivial);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.Defaulted);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.ExplDefaulted);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.ImplRetZero);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.Constexp);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.SkippedBody);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.LateParsed);
+  Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 3)); // Linkage
+  Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));   // LocEnd
+  AbvFixedOrLiteral(Abv, 1, FuncParams.HasBody);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.HasAttrs);
+  AbvFixedOrLiteral(Abv, 1, FuncParams.HasExtInfo);
+  AbvFixedOrLiteral(Abv, 3, FuncParams.TemplKind);
+  AbvVBROrLiteral(Abv, FuncParams.Redecl);           // Redeclarable
+  // Redeclarable, template information, attribute-specific data and Type Source
+  // Info.
+  Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));
+  Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Array));
+  Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));   // TypeLoc
+  DeclFunctionAbbrev = Stream.EmitAbbrev(std::move(Abv));
+
   // Abbreviation for DECL_CXX_METHOD
   Abv = std::make_shared<BitCodeAbbrev>();
   Abv->Add(BitCodeAbbrevOp(serialization::DECL_CXX_METHOD));
-  // RedeclarableDecl
-  Abv->Add(BitCodeAbbrevOp(0));                         // CanonicalDecl
   // Decl
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));   // DeclContext
   Abv->Add(BitCodeAbbrevOp(0));                         // LexicalDeclContext
   Abv->Add(BitCodeAbbrevOp(0));                         // Invalid
-  Abv->Add(BitCodeAbbrevOp(0));                         // HasAttrs
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 1)); // Implicit
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 1)); // Used
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 1)); // Referenced
@@ -2016,7 +2158,6 @@ void ASTWriter::WriteDeclAbbrevs() {
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));   // Type
   // DeclaratorDecl
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));   // InnerLocStart
-  Abv->Add(BitCodeAbbrevOp(0));                         // HasExtInfo
   // FunctionDecl
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 11)); // IDNS
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 3)); // StorageClass
@@ -2036,7 +2177,12 @@ void ASTWriter::WriteDeclAbbrevs() {
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 1)); // LateParsed
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 3)); // Linkage
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::VBR, 6));   // LocEnd
+  Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 1)); // Has a body
+  Abv->Add(BitCodeAbbrevOp(0));                         // HasAttrs
+  Abv->Add(BitCodeAbbrevOp(0));                         // HasExtInfo
   Abv->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Fixed, 3)); // TemplateKind
+  // RedeclarableDecl
+  Abv->Add(BitCodeAbbrevOp(0));                         // CanonicalDecl
   // This Array slurps the rest of the record. Fortunately we want to encode
   // (nearly) all the remaining (variable number of) fields in the same way.
   //
@@ -2169,7 +2315,7 @@ static bool isRequiredDecl(const Decl *D, ASTContext &Context,
   return Context.DeclMustBeEmitted(D);
 }
 
-void ASTWriter::WriteDecl(ASTContext &Context, Decl *D) {
+void ASTWriter::WriteDecl(ASTContext &Context, Decl *D, FunctionAbbrevParams P) {
   // Determine the ID for this declaration.
   serialization::DeclID ID;
   assert(!D->isFromASTFile() && "should not be emitting imported decl");
@@ -2182,7 +2328,7 @@ void ASTWriter::WriteDecl(ASTContext &Context, Decl *D) {
   assert(ID >= FirstDeclID && "invalid decl ID");
   
   RecordData Record;
-  ASTDeclWriter W(*this, Context, Record);
+  ASTDeclWriter W(*this, Context, Record, P);
 
   // Build a record for this declaration
   W.Visit(D);

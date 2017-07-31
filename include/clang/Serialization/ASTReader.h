@@ -2101,6 +2101,20 @@ public:
   void ReadAttributes(ModuleFile &F, AttrVec &Attrs,
                       const RecordData &Record, unsigned &Idx);
 
+  typedef SmallVector<attr::Kind, 4> AttrKindsVec;
+  typedef SmallVector<SourceRange, 4> SourceRangeVec;
+
+  void ReadAttributeCommonFields(ModuleFile &F, AttrKindsVec &Kinds,
+                                 SourceRangeVec &Ranges,
+                                 const RecordData &Record, unsigned &Idx);
+
+  void ReadAttributePadding(ModuleFile &F, unsigned AttrSize, unsigned MaxAttrs,
+                            const RecordData &Record, unsigned &Idx);
+
+  void ReadAttributeSpecificFields(ModuleFile &F, AttrVec &Attrs,
+                                   AttrKindsVec &Kinds, SourceRangeVec &Ranges,
+                                   const RecordData &Record, unsigned &Idx);
+
   /// \brief Reads a statement.
   Stmt *ReadStmt(ModuleFile &F);
 
@@ -2456,6 +2470,22 @@ public:
   /// \brief Reads attributes from the current stream position, advancing Idx.
   void readAttributes(AttrVec &Attrs) {
     return Reader->ReadAttributes(*F, Attrs, Record, Idx);
+  }
+
+  void readAttributeCommonFields(ASTReader::AttrKindsVec &Kinds,
+                                 ASTReader::SourceRangeVec &Ranges) {
+    return Reader->ReadAttributeCommonFields(*F, Kinds, Ranges, Record, Idx);
+  }
+
+  void readAttributePadding(unsigned AttrSize, unsigned MaxAttrs) {
+    return Reader->ReadAttributePadding(*F, AttrSize, MaxAttrs, Record, Idx);
+  }
+
+  void readAttributeSpecificFields(AttrVec &Attrs,
+                                   ASTReader::AttrKindsVec &Kinds,
+                                   ASTReader::SourceRangeVec &Ranges) {
+    return Reader->ReadAttributeSpecificFields(*F, Attrs, Kinds, Ranges,
+                                               Record, Idx);
   }
 
   /// \brief Reads a token out of a record, advancing Idx.

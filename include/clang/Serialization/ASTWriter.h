@@ -85,6 +85,44 @@ public:
   typedef SmallVectorImpl<uint64_t> RecordDataImpl;
   typedef ArrayRef<uint64_t> RecordDataRef;
 
+  typedef struct {
+    bool Literal;   // Whether the abbreviation for this function should be a
+                    // literal value.
+    unsigned Value; // The value stored in the abbreviation.
+  } FuncParamSpec;
+
+  typedef struct {
+    FuncParamSpec Ctx;
+    FuncParamSpec Invalid;
+    FuncParamSpec Implicit;
+    FuncParamSpec Used;
+    FuncParamSpec Referenced;
+    FuncParamSpec ObjC;
+    FuncParamSpec Access;
+    FuncParamSpec ModulePrivate;
+    FuncParamSpec NameKind;
+    FuncParamSpec AnonDeclNumber;
+    FuncParamSpec HasExtInfo;
+    FuncParamSpec Inlined;
+    FuncParamSpec InlineSpec;
+    FuncParamSpec VirtualAsWritten;
+    FuncParamSpec Pure;
+    FuncParamSpec InheritedProto;
+    FuncParamSpec WrittenProto;
+    FuncParamSpec Deleted;
+    FuncParamSpec Trivial;
+    FuncParamSpec Defaulted;
+    FuncParamSpec ExplDefaulted;
+    FuncParamSpec ImplRetZero;
+    FuncParamSpec Constexp;
+    FuncParamSpec SkippedBody;
+    FuncParamSpec LateParsed;
+    FuncParamSpec HasBody;
+    FuncParamSpec HasAttrs;
+    FuncParamSpec TemplKind;
+    FuncParamSpec Redecl;
+  } FunctionAbbrevParams;
+
   friend class ASTDeclWriter;
   friend class ASTStmtWriter;
   friend class ASTTypeWriter;
@@ -479,6 +517,7 @@ private:
   unsigned DeclRecordAbbrev = 0;
   unsigned DeclTypedefAbbrev = 0;
   unsigned DeclVarAbbrev = 0;
+  unsigned DeclFunctionAbbrev = 0;
   unsigned DeclFieldAbbrev = 0;
   unsigned DeclEnumAbbrev = 0;
   unsigned DeclObjCIvarAbbrev = 0;
@@ -489,8 +528,8 @@ private:
   unsigned IntegerLiteralAbbrev = 0;
   unsigned ExprImplicitCastAbbrev = 0;
 
-  void WriteDeclAbbrevs();
-  void WriteDecl(ASTContext &Context, Decl *D);
+  void WriteDeclAbbrevs(FunctionAbbrevParams FuncParams);
+  void WriteDecl(ASTContext &Context, Decl *D, FunctionAbbrevParams FuncParams);
 
   uint64_t WriteASTCore(Sema &SemaRef,
                         StringRef isysroot, const std::string &OutputFile,
@@ -645,6 +684,7 @@ public:
   unsigned getDeclRecordAbbrev() const { return DeclRecordAbbrev; }
   unsigned getDeclTypedefAbbrev() const { return DeclTypedefAbbrev; }
   unsigned getDeclVarAbbrev() const { return DeclVarAbbrev; }
+  unsigned getDeclFunctionAbbrev() const { return DeclFunctionAbbrev; }
   unsigned getDeclFieldAbbrev() const { return DeclFieldAbbrev; }
   unsigned getDeclEnumAbbrev() const { return DeclEnumAbbrev; }
   unsigned getDeclObjCIvarAbbrev() const { return DeclObjCIvarAbbrev; }
@@ -916,6 +956,12 @@ public:
 
   /// \brief Emit a list of attributes.
   void AddAttributes(ArrayRef<const Attr*> Attrs);
+
+  void AddAttributeCommonFields(ArrayRef<const Attr*> Attrs);
+
+  void AddAttributePadding(unsigned AttrSize, unsigned MaxAttrs);
+
+  void AddAttributeSpecificFields(ArrayRef<const Attr*> Attrs);
 };
 
 /// \brief AST and semantic-analysis consumer that generates a

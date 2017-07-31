@@ -46,6 +46,9 @@ namespace clang {
     IdentifierInfo *TypedefNameForLinkage;
 
     bool HasPendingBody;
+    uint64_t MaxParams;
+    ASTReader::AttrKindsVec AttrKinds;
+    ASTReader::SourceRangeVec AttrSourceRanges;
 
     ///\brief A flag to carry the information for a decl from the entity is
     /// used. We use it to delay the marking of the canonical decl as used until
@@ -213,7 +216,7 @@ namespace clang {
           ThisDeclID(thisDeclID), ThisDeclLoc(ThisDeclLoc),
           TypeIDForTypeDecl(0), NamedDeclForTagDecl(0),
           TypedefNameForLinkage(nullptr), HasPendingBody(false),
-          IsDeclMarkedUsed(false) {}
+          MaxParams(0), IsDeclMarkedUsed(false) {}
 
     template <typename DeclT>
     static Decl *getMostRecentDeclImpl(Redeclarable<DeclT> *D);
@@ -457,14 +460,13 @@ void ASTDeclReader::Visit(Decl *D) {
     // We only read it if FD doesn't already have a body (e.g., from another
     // module).
     // FIXME: Can we diagnose ODR violations somehow?
-    if (Record.readInt()) {
+    if (HasPendingBody) {
       if (auto *CD = dyn_cast<CXXConstructorDecl>(FD)) {
         CD->NumCtorInitializers = Record.readInt();
         if (CD->NumCtorInitializers)
           CD->CtorInitializers = ReadGlobalOffset();
       }
       Reader.PendingBodies[FD] = GetCurrentCursorOffset();
-      HasPendingBody = true;
     }
   }
 }
@@ -499,7 +501,7 @@ void ASTDeclReader::VisitDecl(Decl *D) {
   }
   D->setLocation(ThisDeclLoc);
   D->setInvalidDecl(Record.readInt());
-  if (Record.readInt()) { // hasAttrs
+  if (!dyn_cast<FunctionDecl>(D) && Record.readInt()) {
     AttrVec Attrs;
     Record.readAttributes(Attrs);
     // Avoid calling setAttrs() directly because it uses Decl::getASTContext()
@@ -717,19 +719,19 @@ void ASTDeclReader::VisitEnumConstantDecl(EnumConstantDecl *ECD) {
 void ASTDeclReader::VisitDeclaratorDecl(DeclaratorDecl *DD) {
   VisitValueDecl(DD);
   DD->setInnerLocStart(ReadSourceLocation());
-  if (Record.readInt()) { // hasExtInfo
-    DeclaratorDecl::ExtInfo *Info
-        = new (Reader.getContext()) DeclaratorDecl::ExtInfo();
-    ReadQualifierInfo(*Info);
-    DD->DeclInfo = Info;
+  if (!dyn_cast<FunctionDecl>(DD)) {
+    if (Record.readInt()) { // hasExtInfo
+      DeclaratorDecl::ExtInfo *Info
+          = new (Reader.getContext()) DeclaratorDecl::ExtInfo();
+      ReadQualifierInfo(*Info);
+      DD->DeclInfo = Info;
+    }
   }
 }
 
 void ASTDeclReader::VisitFunctionDecl(FunctionDecl *FD) {
-  RedeclarableResult Redecl = VisitRedeclarable(FD);
   VisitDeclaratorDecl(FD);
 
-  ReadDeclarationNameLoc(FD->DNLoc, FD->getDeclName());
   FD->IdentifierNamespace = Record.readInt();
 
   // FunctionDecl's body is handled last at ASTDeclReader::Visit,
@@ -753,7 +755,23 @@ void ASTDeclReader::VisitFunctionDecl(FunctionDecl *FD) {
   FD->setCachedLinkage(Linkage(Record.readInt()));
   FD->EndRangeLoc = ReadSourceLocation();
 
-  switch ((FunctionDecl::TemplatedKind)Record.readInt()) {
+  // Read whether the function has a pending body.
+  HasPendingBody = Record.readInt();
+  bool HasAttrs = Record.readInt();
+  bool HasExtInfo = Record.readInt();
+  FunctionDecl::TemplatedKind TK = (FunctionDecl::TemplatedKind)Record.readInt();
+
+  RedeclarableResult Redecl = VisitRedeclarable(FD);
+
+  if (HasExtInfo) {
+    DeclaratorDecl::ExtInfo *Info
+        = new (Reader.getContext()) DeclaratorDecl::ExtInfo();
+    ReadQualifierInfo(*Info);
+    FD->DeclInfo = Info;
+  }
+
+  // Read in template data.
+  switch (TK) {
   case FunctionDecl::TK_NonTemplate:
     mergeRedeclarable(FD, Redecl);
     break;
@@ -859,12 +877,23 @@ void ASTDeclReader::VisitFunctionDecl(FunctionDecl *FD) {
   }
 
   // Read in the parameters.
+  // unsigned MaxNumParams = Record.readInt();
   unsigned NumParams = Record.readInt();
   SmallVector<ParmVarDecl *, 16> Params;
   Params.reserve(NumParams);
   for (unsigned I = 0; I != NumParams; ++I)
     Params.push_back(ReadDeclAs<ParmVarDecl>());
   FD->setParams(Reader.getContext(), Params);
+
+  if (HasAttrs) {
+    AttrVec Attrs;
+    Record.readAttributes(Attrs);
+    // Avoid calling setAttrs() directly because it uses Decl::getASTContext()
+    // internally which is unsafe during derialization.
+    FD->setAttrsImpl(Attrs, Reader.getContext());
+  }
+
+  ReadDeclarationNameLoc(FD->DNLoc, FD->getDeclName());
 }
 
 void ASTDeclReader::VisitObjCMethodDecl(ObjCMethodDecl *MD) {
@@ -2476,6 +2505,43 @@ void ASTReader::ReadAttributes(ModuleFile &F, AttrVec &Attrs,
     Attr *New = nullptr;
     attr::Kind Kind = (attr::Kind)Record[Idx++];
     SourceRange Range = ReadSourceRange(F, Record, Idx);
+
+#include "clang/Serialization/AttrPCHRead.inc"
+
+    assert(New && "Unable to decode attribute?");
+    Attrs.push_back(New);
+  }
+}
+
+void ASTReader::ReadAttributeCommonFields(ModuleFile &F, AttrKindsVec &Kinds,
+                                          SourceRangeVec &Ranges,
+                                          const RecordData &Record,
+                                          unsigned &Idx) {
+  for (unsigned i = 0, e = Record[Idx++]; i != e; ++i) {
+    Kinds.push_back((attr::Kind)Record[Idx++]);
+    Ranges.push_back(ReadSourceRange(F, Record, Idx));
+  }
+}
+
+void ASTReader::ReadAttributePadding(ModuleFile &F, unsigned AttrSize,
+                                      unsigned MaxAttrs,
+                                      const RecordData &Record, unsigned &Idx) {
+  for (unsigned I = AttrSize; I < MaxAttrs; ++I) {
+    Record[Idx++];
+    Record[Idx++];
+    Record[Idx++];
+  }
+}
+
+void ASTReader::ReadAttributeSpecificFields(ModuleFile &F, AttrVec &Attrs,
+                                            AttrKindsVec &Kinds,
+                                            SourceRangeVec &Ranges,
+                                            const RecordData &Record,
+                                            unsigned &Idx) {
+  for (unsigned i = 0, e = Kinds.size(); i != e; ++i) {
+    Attr *New = nullptr;
+    attr::Kind Kind = Kinds[i];
+    SourceRange Range = Ranges[i];
 
 #include "clang/Serialization/AttrPCHRead.inc"
 
